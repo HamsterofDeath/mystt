@@ -30,6 +30,7 @@ $PythonExe = "C:\Users\dhaup\AppData\Local\Programs\Python\Python313\python.exe"
 $VenvPath = Join-Path $ProjectRoot ".venv"
 $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
 $Port = Get-DotEnvValue -Path $EnvPath -Name "SERVICE_PORT" -Default "8765"
+$Backend = Get-DotEnvValue -Path $EnvPath -Name "ASR_BACKEND" -Default "faster-whisper"
 $RuleName = "Whisper PTT HTTP Service ($Port)"
 
 if (-not (Test-Path $PythonExe)) {
@@ -42,12 +43,19 @@ if (-not (Test-Path $VenvPython)) {
 
 & $VenvPython -m pip install --upgrade pip
 & $VenvPython -m pip install -r (Join-Path $ProjectRoot "requirements.txt")
-& $VenvPython -c "import service; service.preload_from_env()"
 
-if ($PreloadMedium) {
-    $env:WHISPER_MODEL = "medium"
+if ($Backend -eq "faster-whisper") {
     & $VenvPython -c "import service; service.preload_from_env()"
-    Remove-Item Env:WHISPER_MODEL
+
+    if ($PreloadMedium) {
+        $env:WHISPER_MODEL = "medium"
+        & $VenvPython -c "import service; service.preload_from_env()"
+        Remove-Item Env:WHISPER_MODEL
+    }
+} else {
+    Write-Host "Skipping faster-whisper preload because ASR_BACKEND=$Backend"
+    Write-Host "If you want the Vulkan path, run:"
+    Write-Host "  .\\build-whispercpp-vulkan.ps1"
 }
 
 if (-not $SkipFirewallRule) {

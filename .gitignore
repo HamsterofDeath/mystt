@@ -6,3 +6,5 @@ models/
 *.log
 sample.wav
 gcm-diagnose.log
+build-vulkan.log
+whisper.cpp/

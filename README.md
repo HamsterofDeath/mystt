@@ -1,48 +1,43 @@
 # Local Whisper PTT Service
 
-Kleiner lokaler HTTP-Service fuer Push-to-Talk-Diktat von einer Ubuntu-VM auf den Windows-Host.
+Lokaler HTTP-Dienst fuer Push-to-Talk-Diktat von einer Ubuntu-VM auf den Windows-Host.
 
-## Design
+## Aktueller Standard
 
-- Backend: `faster-whisper`
-- HTTP: FastAPI
-- Security: Shared secret ueber `X-PTT-Token`
+- Oeffentlicher Endpoint: `POST /transcribe`
+- Security: `X-PTT-Token`
 - Default-Modell: `small`
-- Device auf diesem Host: CPU
+- Aktives Backend auf diesem Host: `whisper.cpp` mit `Vulkan`
+- Aktives Device auf diesem Host: `AMD Radeon RX 7900 XTX`
+- Externe Service-URL fuer die VM: `http://192.168.56.1:8765/transcribe`
 
-Warum CPU auf diesem Rechner: Es ist eine AMD Radeon RX 7900 XTX vorhanden, aber `faster-whisper` nutzt auf Windows fuer GPU-Beschleunigung praktisch CUDA und damit NVIDIA. Deshalb ist hier CPU der robuste und funktionierende Pfad.
+Der bisherige `faster-whisper`-Pfad bleibt als CPU-/CUDA-Fallback im Python-Service erhalten. Aktiv ist im Moment aber `ASR_BACKEND=whispercpp`.
 
-## Installieren
+## Schnellstart
+
+Python-Umgebung:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\install-whisper-service.ps1
 ```
 
-Das Skript erstellt `.venv`, installiert die Python-Abhaengigkeiten, laedt das `small`-Modell vor und versucht eine Firewall-Regel fuer den Port anzulegen.
+Vulkan-Binary + Modell bauen:
 
-Wenn die Ubuntu-VM den Dienst nicht erreicht, fuehre das Installationsskript einmal in einer als Administrator gestarteten PowerShell aus, damit die Firewall-Regel wirklich gesetzt werden kann.
+```powershell
+.\build-whispercpp-vulkan.ps1
+```
 
-## Starten
+Oeffentlichen Dienst starten:
 
 ```powershell
 .\start-whisper-service.ps1
 ```
 
-Alternativ:
+Optionaler Autostart:
 
-```cmd
-start-whisper-service.cmd
+```powershell
+.\register-whisper-service-task.ps1
 ```
-
-## VM-Zieladresse
-
-Fuer eine VirtualBox-VM auf diesem Host ist die passende Host-Adresse:
-
-```text
-http://192.168.56.1:8765/transcribe
-```
-
-Der Dienst lauscht auf `0.0.0.0`, also auch auf anderen Host-Interfaces wie `192.168.0.199`, aber fuer die Host-Only-VM ist `192.168.56.1` die passende Adresse.
 
 ## Request-Beispiel
 
@@ -65,9 +60,18 @@ Windows-Test:
 
 Wichtige Werte in `.env`:
 
-- `PTT_TOKEN`: Shared secret
-- `SERVICE_PORT`: Standard `8765`
-- `WHISPER_MODEL`: Standard `small`, fuer spaeter auch `medium` moeglich
-- `WHISPER_DEVICE`: `auto`, `cpu` oder `cuda`
+- `ASR_BACKEND=whispercpp`
+- `WHISPER_MODEL=small`
+- `WHISPERCPP_BINARY_PATH=whisper.cpp/build-vulkan-vs2022/bin/Release/whisper-server.exe`
+- `WHISPERCPP_MODEL_PATH=whisper.cpp/models/ggml-small.bin`
+- `WHISPERCPP_SERVER_PORT=8766`
 
-Wenn du spaeter auf einem NVIDIA/CUDA-Host landest, kannst du `WHISPER_DEVICE=auto` lassen und bei Bedarf `WHISPER_MODEL=medium` setzen.
+Wenn du auf den alten CPU-/CUDA-Pfad zurueck willst, setze `ASR_BACKEND=faster-whisper` und starte den Dienst neu.
+
+## Avast-Hinweis
+
+Falls Avast CyberCapture den Vulkan-Build blockiert, fuege am besten eine Ausnahme fuer diesen Ordner hinzu:
+
+```text
+C:\Users\dhaup\OneDrive\Dokumente\Playground\whisper.cpp\build-vulkan-vs2022
+```
