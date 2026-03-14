@@ -6,10 +6,12 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import gc
 
 import httpx
 from dotenv import load_dotenv
@@ -67,6 +69,9 @@ class Settings:
     whispercpp_flash_attn: bool
     whispercpp_managed_server: bool
     whispercpp_timeout_ms: int
+    preload_on_start: bool
+    idle_unload_seconds: int
+    idle_check_seconds: int
     log_level: str
 
     @classmethod
@@ -105,6 +110,9 @@ class Settings:
             whispercpp_flash_attn=env_flag("WHISPERCPP_FLASH_ATTN", True),
             whispercpp_managed_server=env_flag("WHISPERCPP_MANAGED_SERVER", True),
             whispercpp_timeout_ms=int(os.getenv("WHISPERCPP_TIMEOUT_MS", "120000")),
+            preload_on_start=env_flag("ASR_PRELOAD_ON_START", False),
+            idle_unload_seconds=int(os.getenv("ASR_IDLE_UNLOAD_SECONDS", "600")),
+            idle_check_seconds=int(os.getenv("ASR_IDLE_CHECK_SECONDS", "15")),
             log_level=os.getenv("LOG_LEVEL", "info").strip().lower() or "info",
         )
 
@@ -167,6 +175,9 @@ class FasterWhisperEngine:
         self.model: WhisperModel | None = None
         self.device = "uninitialized"
         self.compute_type = "unknown"
+        self._state_lock = threading.RLock()
+        self._active_uses = 0
+        self._last_used_at = 0.0
 
     def requested_device(self) -> str:
         if self.settings.requested_device in {"cpu", "cuda"}:
@@ -182,76 +193,127 @@ class FasterWhisperEngine:
             return "float16"
         return "int8"
 
+    def _begin_use(self) -> None:
+        with self._state_lock:
+            self._active_uses += 1
+
+    def _end_use(self) -> None:
+        with self._state_lock:
+            self._active_uses = max(0, self._active_uses - 1)
+            self._last_used_at = time.monotonic()
+
     def load(self) -> None:
         if not self.settings.token:
             raise RuntimeError("PTT_TOKEN is missing in .env")
 
-        if self.model is not None:
-            return
+        with self._state_lock:
+            if self.model is not None:
+                return
 
-        self.settings.download_root.mkdir(parents=True, exist_ok=True)
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
+            self.settings.download_root.mkdir(parents=True, exist_ok=True)
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-        requested_device = self.requested_device()
-        requested_compute_type = self.requested_compute_type(requested_device)
-        logging.info(
-            "Loading faster-whisper model '%s' on %s (%s)",
-            self.settings.model_name,
-            requested_device,
-            requested_compute_type,
-        )
+            requested_device = self.requested_device()
+            requested_compute_type = self.requested_compute_type(requested_device)
+            logging.info(
+                "Loading faster-whisper model '%s' on %s (%s)",
+                self.settings.model_name,
+                requested_device,
+                requested_compute_type,
+            )
 
-        try:
+            try:
+                self.model = WhisperModel(
+                    self.settings.model_name,
+                    device=requested_device,
+                    compute_type=requested_compute_type,
+                    cpu_threads=self.settings.cpu_threads,
+                    download_root=str(self.settings.download_root),
+                )
+                self.device = requested_device
+                self.compute_type = requested_compute_type
+                self._last_used_at = time.monotonic()
+                return
+            except Exception as exc:
+                if requested_device != "cuda":
+                    raise
+                logging.warning("CUDA init failed, falling back to CPU: %s", exc)
+
             self.model = WhisperModel(
                 self.settings.model_name,
-                device=requested_device,
-                compute_type=requested_compute_type,
+                device="cpu",
+                compute_type="int8",
                 cpu_threads=self.settings.cpu_threads,
                 download_root=str(self.settings.download_root),
             )
-            self.device = requested_device
-            self.compute_type = requested_compute_type
-            return
-        except Exception as exc:
-            if requested_device != "cuda":
-                raise
-            logging.warning("CUDA init failed, falling back to CPU: %s", exc)
+            self.device = "cpu"
+            self.compute_type = "int8"
+            self._last_used_at = time.monotonic()
 
-        self.model = WhisperModel(
-            self.settings.model_name,
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=self.settings.cpu_threads,
-            download_root=str(self.settings.download_root),
-        )
-        self.device = "cpu"
-        self.compute_type = "int8"
+    def is_loaded(self) -> bool:
+        with self._state_lock:
+            return self.model is not None
+
+    def reported_device(self) -> str:
+        if self.is_loaded():
+            return self.device
+        return self.requested_device()
+
+    def unload(self) -> bool:
+        with self._state_lock:
+            if self.model is None:
+                return False
+            logging.info("Unloading faster-whisper model '%s' after idle timeout", self.settings.model_name)
+            self.model = None
+            gc.collect()
+            return True
+
+    def maybe_unload_idle(self) -> bool:
+        if self.settings.idle_unload_seconds <= 0:
+            return False
+
+        with self._state_lock:
+            if self.model is None or self._active_uses > 0:
+                return False
+            if self._last_used_at <= 0:
+                return False
+            if (time.monotonic() - self._last_used_at) < self.settings.idle_unload_seconds:
+                return False
+
+        return self.unload()
+
+    def shutdown(self) -> None:
+        self.unload()
 
     def transcribe(self, audio_path: Path, language: str | None) -> dict[str, object]:
-        self.load()
-        assert self.model is not None
+        self._begin_use()
+        try:
+            self.load()
+            assert self.model is not None
 
-        started_at = time.perf_counter()
-        segments, info = self.model.transcribe(
-            str(audio_path),
-            task="transcribe",
-            language=language,
-            beam_size=1,
-            best_of=1,
-            condition_on_previous_text=False,
-            vad_filter=False,
-            temperature=0.0,
-        )
-        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
-        duration_ms = int((time.perf_counter() - started_at) * 1000)
+            started_at = time.perf_counter()
+            segments, info = self.model.transcribe(
+                str(audio_path),
+                task="transcribe",
+                language=language,
+                beam_size=1,
+                best_of=1,
+                condition_on_previous_text=False,
+                vad_filter=False,
+                temperature=0.0,
+            )
+            text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
 
-        return {
-            "text": text,
-            "language": info.language or language or "",
-            "duration_ms": duration_ms,
-            "device": self.device,
-            "model": self.settings.model_name,
-        }
+            return {
+                "text": text,
+                "language": info.language or language or "",
+                "duration_ms": duration_ms,
+                "device": self.device,
+                "model": self.settings.model_name,
+            }
+        finally:
+            self._end_use()
 
 
 class WhisperCppEngine:
@@ -262,6 +324,9 @@ class WhisperCppEngine:
         self.stdout_handle = None
         self.stderr_handle = None
         self.device = "vulkan"
+        self._state_lock = threading.RLock()
+        self._active_uses = 0
+        self._last_used_at = 0.0
 
     def _is_ready(self) -> bool:
         try:
@@ -270,11 +335,28 @@ class WhisperCppEngine:
             return False
         return response.status_code == 200
 
+    def _begin_use(self) -> None:
+        with self._state_lock:
+            self._active_uses += 1
+
+    def _end_use(self) -> None:
+        with self._state_lock:
+            self._active_uses = max(0, self._active_uses - 1)
+            self._last_used_at = time.monotonic()
+
     def _stderr_tail(self) -> str:
         stderr_path = ROOT / "whispercpp.stderr.log"
         if not stderr_path.exists():
             return ""
         return "\n".join(stderr_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-20:])
+
+    def _close_logs(self) -> None:
+        if self.stdout_handle:
+            self.stdout_handle.close()
+            self.stdout_handle = None
+        if self.stderr_handle:
+            self.stderr_handle.close()
+            self.stderr_handle = None
 
     def _start_server(self) -> None:
         if self.process and self.process.poll() is None:
@@ -326,23 +408,27 @@ class WhisperCppEngine:
         if not self.settings.token:
             raise RuntimeError("PTT_TOKEN is missing in .env")
 
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
-        if self._is_ready():
-            return
+        with self._state_lock:
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            if self._is_ready():
+                self._last_used_at = time.monotonic()
+                return
 
-        if not self.settings.whispercpp_managed_server:
-            raise RuntimeError(f"whisper.cpp backend is not reachable at {self.base_url}")
+            if not self.settings.whispercpp_managed_server:
+                raise RuntimeError(f"whisper.cpp backend is not reachable at {self.base_url}")
 
-        logging.info(
-            "Starting whisper.cpp Vulkan backend on %s using %s",
-            self.base_url,
-            self.settings.whispercpp_model_path,
-        )
-        self._start_server()
+            logging.info(
+                "Starting whisper.cpp Vulkan backend on %s using %s",
+                self.base_url,
+                self.settings.whispercpp_model_path,
+            )
+            self._start_server()
 
         deadline = time.time() + 120
         while time.time() < deadline:
             if self._is_ready():
+                with self._state_lock:
+                    self._last_used_at = time.monotonic()
                 return
             if self.process and self.process.poll() is not None:
                 raise RuntimeError(
@@ -352,60 +438,142 @@ class WhisperCppEngine:
 
         raise RuntimeError("whisper.cpp server did not become ready in time")
 
+    def is_loaded(self) -> bool:
+        with self._state_lock:
+            process_running = self.process is not None and self.process.poll() is None
+        if process_running:
+            return self._is_ready()
+        return False
+
+    def reported_device(self) -> str:
+        return self.device
+
+    def unload(self) -> bool:
+        with self._state_lock:
+            if self.process is None or self.process.poll() is not None:
+                self._close_logs()
+                self.process = None
+                return False
+            logging.info("Stopping whisper.cpp backend after idle timeout")
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+            self.process = None
+            self._close_logs()
+            return True
+
+    def maybe_unload_idle(self) -> bool:
+        if self.settings.idle_unload_seconds <= 0:
+            return False
+
+        with self._state_lock:
+            if self._active_uses > 0:
+                return False
+            if self.process is None or self.process.poll() is not None:
+                return False
+            if self._last_used_at <= 0:
+                return False
+            if (time.monotonic() - self._last_used_at) < self.settings.idle_unload_seconds:
+                return False
+
+        return self.unload()
+
+    def shutdown(self) -> None:
+        self.unload()
+
     def transcribe(self, audio_path: Path, language: str | None) -> dict[str, object]:
-        self.load()
+        self._begin_use()
+        try:
+            self.load()
 
-        started_at = time.perf_counter()
-        data = {
-            "language": language or "auto",
-            "response_format": "verbose_json",
-            "temperature": "0.0",
-            "temperature_inc": "0.0",
-        }
-        with audio_path.open("rb") as audio_file:
-            response = httpx.post(
-                f"{self.base_url}/inference",
-                data=data,
-                files={"file": (audio_path.name, audio_file, "audio/wav")},
-                timeout=self.settings.whispercpp_timeout_ms / 1000,
+            started_at = time.perf_counter()
+            data = {
+                "language": language or "auto",
+                "response_format": "verbose_json",
+                "temperature": "0.0",
+                "temperature_inc": "0.0",
+            }
+            with audio_path.open("rb") as audio_file:
+                response = httpx.post(
+                    f"{self.base_url}/inference",
+                    data=data,
+                    files={"file": (audio_path.name, audio_file, "audio/wav")},
+                    timeout=self.settings.whispercpp_timeout_ms / 1000,
+                )
+            response.raise_for_status()
+            payload = response.json()
+
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            detected_language = (
+                payload.get("detected_language")
+                or payload.get("language")
+                or language
+                or ""
             )
-        response.raise_for_status()
-        payload = response.json()
 
-        duration_ms = int((time.perf_counter() - started_at) * 1000)
-        detected_language = (
-            payload.get("detected_language")
-            or payload.get("language")
-            or language
-            or ""
-        )
+            return {
+                "text": clean_text(str(payload.get("text", ""))),
+                "language": normalize_detected_language(str(detected_language), language),
+                "duration_ms": duration_ms,
+                "device": self.device,
+                "model": self.settings.model_name,
+            }
+        finally:
+            self._end_use()
 
-        return {
-            "text": clean_text(str(payload.get("text", ""))),
-            "language": normalize_detected_language(str(detected_language), language),
-            "duration_ms": duration_ms,
-            "device": self.device,
-            "model": self.settings.model_name,
-        }
+
+class IdleUnloadMonitor:
+    def __init__(self, engine: FasterWhisperEngine | WhisperCppEngine, interval_seconds: int) -> None:
+        self.engine = engine
+        self.interval_seconds = max(1, interval_seconds)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="asr-idle-monitor", daemon=True)
+
+    def start(self) -> None:
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_seconds):
+            try:
+                self.engine.maybe_unload_idle()
+            except Exception:
+                logging.exception("Idle unload check failed")
 
 
 SETTINGS = Settings.from_env()
 configure_logging(SETTINGS.log_level)
 ENGINE = WhisperCppEngine(SETTINGS) if SETTINGS.backend == "whispercpp" else FasterWhisperEngine(SETTINGS)
+IDLE_MONITOR = IdleUnloadMonitor(ENGINE, SETTINGS.idle_check_seconds)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    ENGINE.load()
+    IDLE_MONITOR.start()
+    if SETTINGS.preload_on_start:
+        ENGINE.load()
     logging.info(
-        "ASR service ready at http://%s:%s using backend=%s (reachable from VM at http://%s:%s)",
+        "ASR service ready at http://%s:%s using backend=%s preload_on_start=%s idle_unload_seconds=%s (reachable from VM at http://%s:%s)",
         SETTINGS.bind_host,
         SETTINGS.port,
         SETTINGS.backend,
+        SETTINGS.preload_on_start,
+        SETTINGS.idle_unload_seconds,
         SETTINGS.host_accessible_ip,
         SETTINGS.port,
     )
-    yield
+    try:
+        yield
+    finally:
+        IDLE_MONITOR.stop()
+        ENGINE.shutdown()
 
 
 app = FastAPI(title="Local Whisper PTT Service", lifespan=lifespan)
@@ -413,12 +581,14 @@ app = FastAPI(title="Local Whisper PTT Service", lifespan=lifespan)
 
 @app.get("/healthz")
 async def healthz() -> dict[str, object]:
-    ENGINE.load()
     return {
         "status": "ok",
         "backend": SETTINGS.backend,
-        "device": getattr(ENGINE, "device", "unknown"),
+        "device": ENGINE.reported_device(),
+        "loaded": ENGINE.is_loaded(),
         "model": SETTINGS.model_name,
+        "preload_on_start": SETTINGS.preload_on_start,
+        "idle_unload_seconds": SETTINGS.idle_unload_seconds,
         "host_accessible_url": f"http://{SETTINGS.host_accessible_ip}:{SETTINGS.port}",
     }
 
@@ -461,4 +631,3 @@ if __name__ == "__main__":
         port=SETTINGS.port,
         log_level=SETTINGS.log_level,
     )
-
