@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+.tmp/
+models/
+*.log
+sample.wav
+gcm-diagnose.log
