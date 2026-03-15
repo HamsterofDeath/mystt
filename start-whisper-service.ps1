@@ -7,6 +7,15 @@ if (-not (Test-Path $VenvPython)) {
     throw "Virtual environment not found. Run .\install-whisper-service.ps1 first."
 }
 
+$ExistingProcess = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+    Where-Object { $_.CommandLine -like "*service.py*" } |
+    Select-Object -First 1
+
+if ($ExistingProcess) {
+    Write-Host "Whisper service is already running (PID $($ExistingProcess.ProcessId))."
+    exit 0
+}
+
 Push-Location $ProjectRoot
 try {
     $env:PYTHONUNBUFFERED = "1"
@@ -14,4 +23,3 @@ try {
 } finally {
     Pop-Location
 }
-

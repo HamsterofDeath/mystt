@@ -11,7 +11,8 @@ Lokaler HTTP-Dienst fuer Push-to-Talk-Diktat von einer Ubuntu-VM auf den Windows
 - Aktives Device auf diesem Host: `AMD Radeon RX 7900 XTX`
 - Externe Service-URL fuer die VM: `http://192.168.56.1:8765/transcribe`
 - Startverhalten: HTTP-Dienst beim Login, Modell per Lazy-Load beim ersten Request
-- Idle-Unload: nach `600` Sekunden ohne Request
+- Idle-Unload: nach `900` Sekunden ohne Request
+- Anti-Halluzinationen: Silero-VAD, deaktivierter Text-Context (`-mc 0`), `--suppress-nst`, strengerer No-Speech-Threshold und vorgelagerte WAV-Silence-Gate
 
 Der bisherige `faster-whisper`-Pfad bleibt als CPU-/CUDA-Fallback im Python-Service erhalten. Aktiv ist im Moment aber `ASR_BACKEND=whispercpp`.
 
@@ -71,8 +72,18 @@ Wichtige Werte in `.env`:
 - `WHISPERCPP_BINARY_PATH=whisper.cpp/build-vulkan-vs2022/bin/Release/whisper-server.exe`
 - `WHISPERCPP_MODEL_PATH=whisper.cpp/models/ggml-small.bin`
 - `WHISPERCPP_SERVER_PORT=8766`
+- `WHISPERCPP_VAD_ENABLED=true`
+- `WHISPERCPP_VAD_MODEL_PATH=whisper.cpp/models/ggml-silero-v6.2.0.bin`
+- `WHISPERCPP_VAD_THRESHOLD=0.6`
+- `WHISPERCPP_NO_CONTEXT=true`
+- `WHISPERCPP_SUPPRESS_NST=true`
+- `WHISPERCPP_NO_FALLBACK=true`
+- `WHISPERCPP_NO_SPEECH_THRESHOLD=0.75`
+- `WAV_SILENCE_GATE_ENABLED=true`
+- `WAV_SILENCE_PEAK_DBFS=-45`
+- `WAV_SILENCE_RMS_DBFS=-55`
 - `ASR_PRELOAD_ON_START=false`
-- `ASR_IDLE_UNLOAD_SECONDS=600`
+- `ASR_IDLE_UNLOAD_SECONDS=900`
 - `ASR_IDLE_CHECK_SECONDS=15`
 
 Wenn du auf den alten CPU-/CUDA-Pfad zurueck willst, setze `ASR_BACKEND=faster-whisper` und starte den Dienst neu.

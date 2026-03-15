@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import logging
 import os
 import secrets
@@ -8,6 +9,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import wave
+from array import array
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +72,16 @@ class Settings:
     whispercpp_flash_attn: bool
     whispercpp_managed_server: bool
     whispercpp_timeout_ms: int
+    whispercpp_vad_enabled: bool
+    whispercpp_vad_model_path: Path
+    whispercpp_vad_threshold: float
+    whispercpp_no_context: bool
+    whispercpp_suppress_nst: bool
+    whispercpp_no_fallback: bool
+    whispercpp_no_speech_threshold: float
+    wav_silence_gate_enabled: bool
+    wav_silence_peak_dbfs: float
+    wav_silence_rms_dbfs: float
     preload_on_start: bool
     idle_unload_seconds: int
     idle_check_seconds: int
@@ -88,6 +101,10 @@ class Settings:
         whispercpp_model_path = resolve_path(
             os.getenv("WHISPERCPP_MODEL_PATH", "whisper.cpp/models/ggml-small.bin"),
             "whisper.cpp/models/ggml-small.bin",
+        )
+        whispercpp_vad_model_path = resolve_path(
+            os.getenv("WHISPERCPP_VAD_MODEL_PATH", "whisper.cpp/models/ggml-silero-v6.2.0.bin"),
+            "whisper.cpp/models/ggml-silero-v6.2.0.bin",
         )
 
         return cls(
@@ -110,6 +127,16 @@ class Settings:
             whispercpp_flash_attn=env_flag("WHISPERCPP_FLASH_ATTN", True),
             whispercpp_managed_server=env_flag("WHISPERCPP_MANAGED_SERVER", True),
             whispercpp_timeout_ms=int(os.getenv("WHISPERCPP_TIMEOUT_MS", "120000")),
+            whispercpp_vad_enabled=env_flag("WHISPERCPP_VAD_ENABLED", True),
+            whispercpp_vad_model_path=whispercpp_vad_model_path,
+            whispercpp_vad_threshold=float(os.getenv("WHISPERCPP_VAD_THRESHOLD", "0.6")),
+            whispercpp_no_context=env_flag("WHISPERCPP_NO_CONTEXT", True),
+            whispercpp_suppress_nst=env_flag("WHISPERCPP_SUPPRESS_NST", True),
+            whispercpp_no_fallback=env_flag("WHISPERCPP_NO_FALLBACK", True),
+            whispercpp_no_speech_threshold=float(os.getenv("WHISPERCPP_NO_SPEECH_THRESHOLD", "0.75")),
+            wav_silence_gate_enabled=env_flag("WAV_SILENCE_GATE_ENABLED", True),
+            wav_silence_peak_dbfs=float(os.getenv("WAV_SILENCE_PEAK_DBFS", "-45")),
+            wav_silence_rms_dbfs=float(os.getenv("WAV_SILENCE_RMS_DBFS", "-55")),
             preload_on_start=env_flag("ASR_PRELOAD_ON_START", False),
             idle_unload_seconds=int(os.getenv("ASR_IDLE_UNLOAD_SECONDS", "600")),
             idle_check_seconds=int(os.getenv("ASR_IDLE_CHECK_SECONDS", "15")),
@@ -167,6 +194,100 @@ def clean_text(text: str) -> str:
     if cleaned == "[BLANK_AUDIO]":
         return ""
     return cleaned
+
+
+@dataclass
+class WavLevelInfo:
+    duration_ms: int
+    peak_dbfs: float
+    rms_dbfs: float
+
+
+def format_dbfs(value: float) -> str:
+    if math.isinf(value):
+        return "-inf"
+    return f"{value:.1f}"
+
+
+def inspect_wav_levels(audio_path: Path) -> WavLevelInfo | None:
+    try:
+        with wave.open(str(audio_path), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            frame_count = wav_file.getnframes()
+            sample_width = wav_file.getsampwidth()
+            frames = wav_file.readframes(frame_count)
+    except (wave.Error, EOFError):
+        return None
+
+    if frame_rate <= 0 or frame_count <= 0 or not frames:
+        return WavLevelInfo(duration_ms=0, peak_dbfs=-math.inf, rms_dbfs=-math.inf)
+
+    duration_ms = int((frame_count / frame_rate) * 1000)
+
+    if sample_width == 1:
+        max_possible = 127
+        max_abs = 0
+        sum_squares = 0.0
+        sample_count = len(frames)
+        for raw_sample in frames:
+            centered = raw_sample - 128
+            abs_sample = abs(centered)
+            if abs_sample > max_abs:
+                max_abs = abs_sample
+            sum_squares += centered * centered
+    elif sample_width == 2:
+        samples = array("h")
+        samples.frombytes(frames)
+        if not samples:
+            return WavLevelInfo(duration_ms=duration_ms, peak_dbfs=-math.inf, rms_dbfs=-math.inf)
+        max_possible = 32767
+        max_abs = 0
+        sum_squares = 0.0
+        sample_count = len(samples)
+        for sample in samples:
+            abs_sample = abs(sample)
+            if abs_sample > max_abs:
+                max_abs = abs_sample
+            sum_squares += sample * sample
+    elif sample_width == 4:
+        samples = array("i")
+        samples.frombytes(frames)
+        if not samples:
+            return WavLevelInfo(duration_ms=duration_ms, peak_dbfs=-math.inf, rms_dbfs=-math.inf)
+        max_possible = 2147483647
+        max_abs = 0
+        sum_squares = 0.0
+        sample_count = len(samples)
+        for sample in samples:
+            abs_sample = abs(sample)
+            if abs_sample > max_abs:
+                max_abs = abs_sample
+            sum_squares += sample * sample
+    else:
+        return None
+
+    if sample_count <= 0 or max_abs <= 0:
+        return WavLevelInfo(duration_ms=duration_ms, peak_dbfs=-math.inf, rms_dbfs=-math.inf)
+
+    peak_ratio = min(1.0, max_abs / max_possible)
+    rms_ratio = min(1.0, math.sqrt(sum_squares / sample_count) / max_possible)
+    peak_dbfs = 20.0 * math.log10(peak_ratio) if peak_ratio > 0 else -math.inf
+    rms_dbfs = 20.0 * math.log10(rms_ratio) if rms_ratio > 0 else -math.inf
+
+    return WavLevelInfo(duration_ms=duration_ms, peak_dbfs=peak_dbfs, rms_dbfs=rms_dbfs)
+
+
+def should_skip_as_silence(audio_path: Path, settings: Settings) -> WavLevelInfo | None:
+    if not settings.wav_silence_gate_enabled:
+        return None
+
+    levels = inspect_wav_levels(audio_path)
+    if levels is None:
+        return None
+
+    if levels.peak_dbfs <= settings.wav_silence_peak_dbfs and levels.rms_dbfs <= settings.wav_silence_rms_dbfs:
+        return levels
+    return None
 
 
 class FasterWhisperEngine:
@@ -366,6 +487,8 @@ class WhisperCppEngine:
             raise RuntimeError(f"whisper.cpp server not found at {self.settings.whispercpp_binary_path}")
         if not self.settings.whispercpp_model_path.exists():
             raise RuntimeError(f"whisper.cpp model not found at {self.settings.whispercpp_model_path}")
+        if self.settings.whispercpp_vad_enabled and not self.settings.whispercpp_vad_model_path.exists():
+            raise RuntimeError(f"whisper.cpp VAD model not found at {self.settings.whispercpp_vad_model_path}")
 
         stdout_path = ROOT / "whispercpp.stdout.log"
         stderr_path = ROOT / "whispercpp.stderr.log"
@@ -390,9 +513,25 @@ class WhisperCppEngine:
             "1",
             "-bs",
             "1",
+            "-nth",
+            str(self.settings.whispercpp_no_speech_threshold),
         ]
         if self.settings.whispercpp_flash_attn:
             args.append("-fa")
+        if self.settings.whispercpp_no_context:
+            args.extend(["-mc", "0"])
+        if self.settings.whispercpp_suppress_nst:
+            args.append("-sns")
+        if self.settings.whispercpp_no_fallback:
+            args.append("-nf")
+        if self.settings.whispercpp_vad_enabled:
+            args.extend([
+                "--vad",
+                "-vm",
+                str(self.settings.whispercpp_vad_model_path),
+                "-vt",
+                str(self.settings.whispercpp_vad_threshold),
+            ])
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.process = subprocess.Popen(
@@ -604,6 +743,7 @@ async def transcribe(
         raise HTTPException(status_code=401, detail="invalid token")
 
     selected_language = normalize_language(request.query_params.get("language") or language)
+    started_at = time.perf_counter()
 
     suffix = Path(audio.filename or "upload.wav").suffix or ".wav"
     temp_path: Path | None = None
@@ -611,7 +751,26 @@ async def transcribe(
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=TMP_DIR) as handle:
             shutil.copyfileobj(audio.file, handle)
             temp_path = Path(handle.name)
-        return ENGINE.transcribe(temp_path, selected_language)
+        silent_levels = should_skip_as_silence(temp_path, SETTINGS)
+        if silent_levels is not None:
+            logging.info(
+                "Skipping ASR for silent WAV (%sms, peak=%s dBFS, rms=%s dBFS)",
+                silent_levels.duration_ms,
+                format_dbfs(silent_levels.peak_dbfs),
+                format_dbfs(silent_levels.rms_dbfs),
+            )
+            return {
+                "text": "",
+                "language": selected_language or "",
+                "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                "device": ENGINE.reported_device(),
+                "model": SETTINGS.model_name,
+            }
+        try:
+            return ENGINE.transcribe(temp_path, selected_language)
+        except Exception as exc:
+            logging.exception("Transcription request failed")
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
     finally:
         await audio.close()
         if temp_path and temp_path.exists():
