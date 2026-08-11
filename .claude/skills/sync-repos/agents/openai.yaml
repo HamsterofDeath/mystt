@@ -1,0 +1,4 @@
+interface:
+  display_name: "Synchronize Repositories"
+  short_description: "Clone missing, reconcile, and push repositories"
+  default_prompt: "Use $sync-repos to clone newly added repositories and commit, reconcile, and push every repository in scope."

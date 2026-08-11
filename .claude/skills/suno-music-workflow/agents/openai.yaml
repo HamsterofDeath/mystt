@@ -1,0 +1,4 @@
+interface:
+  display_name: "Suno Music Workflow"
+  short_description: "Create and download Suno music assets"
+  default_prompt: "Use $suno-music-workflow to create Suno song variants and download MP3 assets through the Windows Firefox session."

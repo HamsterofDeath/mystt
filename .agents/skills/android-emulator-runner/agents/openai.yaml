@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Emulator Runner"
+  short_description: "Reliable Android emulator smoke workflows"
+  default_prompt: "Use $android-emulator-runner to launch an Android emulator, install the debug APK, and capture smoke-test evidence."

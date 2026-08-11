@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android USB Deploy"
+  short_description: "Build and install Android apps with Windows adb"
+  default_prompt: "Use $android-usb-deploy to build, install, launch, or inspect Android apps from Linux while using Windows adb.exe for all phone transport."

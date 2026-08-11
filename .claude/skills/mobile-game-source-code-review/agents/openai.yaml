@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mobile Game Source Code Review"
+  short_description: "Review Kotlin mobile game code quality"
+  default_prompt: "Use $mobile-game-source-code-review to review this mobile game codebase for Kotlin-only source, focused classes, and 90% logic test coverage."

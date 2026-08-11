@@ -1,0 +1,4 @@
+interface:
+  display_name: "Open in Firefox"
+  short_description: "Stage files and open them in Firefox"
+  default_prompt: "Use $open-in-firefox to stage this HTML file in my Windows Startup folder and open it in Firefox."
