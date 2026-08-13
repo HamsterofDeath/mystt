@@ -1,4 +1,0 @@
-interface:
-  display_name: "Jira Project Helper"
-  short_description: "Administer Jira projects, the Kanban board, and ticket workflows safely"
-  default_prompt: "Use $jira-project-helper for Jira projects, the Kanban board, our tickets, or commands like implement all tickets and verify all tickets."

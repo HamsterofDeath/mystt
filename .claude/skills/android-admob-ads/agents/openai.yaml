@@ -1,4 +1,0 @@
-interface:
-  display_name: "Android AdMob Ads"
-  short_description: "Integrate AdMob ads in Android apps."
-  default_prompt: "Use $android-admob-ads to add or audit AdMob ad integration in this Android app."

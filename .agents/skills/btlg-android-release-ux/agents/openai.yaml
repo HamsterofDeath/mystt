@@ -1,4 +1,0 @@
-interface:
-  display_name: "BTLG Android Release UX"
-  short_description: "Apply BTLG Android ads, unlock, review, and support patterns."
-  default_prompt: "Use $btlg-android-release-ux to audit or implement the standard BTLG Android release UX pattern."

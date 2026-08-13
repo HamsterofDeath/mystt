@@ -1,4 +1,0 @@
-interface:
-  display_name: "ElevenLabs Voice Production"
-  short_description: "Generate and debug clean ElevenLabs narration"
-  default_prompt: "Use $elevenlabs-voice-production to generate and verify clean sentence-level narration for this video."

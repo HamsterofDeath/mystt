@@ -1,7 +1,0 @@
-interface:
-  display_name: "OpenClaw Browser"
-  short_description: "Control OpenClaw Chrome from Codex"
-  default_prompt: "Use $openclaw-browser to open a page, inspect the snapshot, interact with the UI, or upload a file through the OpenClaw browser."
-
-policy:
-  allow_implicit_invocation: true
