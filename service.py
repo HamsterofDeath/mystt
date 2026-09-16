@@ -19,7 +19,6 @@ import gc
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from faster_whisper import WhisperModel
 
 
 ROOT = Path(__file__).resolve().parent
@@ -79,6 +78,10 @@ class Settings:
     whispercpp_suppress_nst: bool
     whispercpp_no_fallback: bool
     whispercpp_no_speech_threshold: float
+    openai_model: str
+    openai_api_key: str
+    openai_base_url: str
+    openai_timeout_ms: int
     wav_silence_gate_enabled: bool
     wav_silence_peak_dbfs: float
     wav_silence_rms_dbfs: float
@@ -134,6 +137,11 @@ class Settings:
             whispercpp_suppress_nst=env_flag("WHISPERCPP_SUPPRESS_NST", True),
             whispercpp_no_fallback=env_flag("WHISPERCPP_NO_FALLBACK", True),
             whispercpp_no_speech_threshold=float(os.getenv("WHISPERCPP_NO_SPEECH_THRESHOLD", "0.75")),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-transcribe").strip() or "gpt-4o-transcribe",
+            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+            openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+            or "https://api.openai.com/v1",
+            openai_timeout_ms=int(os.getenv("OPENAI_TIMEOUT_MS", "120000")),
             wav_silence_gate_enabled=env_flag("WAV_SILENCE_GATE_ENABLED", True),
             wav_silence_peak_dbfs=float(os.getenv("WAV_SILENCE_PEAK_DBFS", "-45")),
             wav_silence_rms_dbfs=float(os.getenv("WAV_SILENCE_RMS_DBFS", "-55")),
@@ -327,6 +335,13 @@ class FasterWhisperEngine:
         if not self.settings.token:
             raise RuntimeError("PTT_TOKEN is missing in .env")
 
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "faster-whisper is not installed; run install-whisper-service.ps1 or use ASR_BACKEND=openai"
+            ) from exc
+
         with self._state_lock:
             if self.model is not None:
                 return
@@ -379,6 +394,9 @@ class FasterWhisperEngine:
         if self.is_loaded():
             return self.device
         return self.requested_device()
+
+    def reported_model(self) -> str:
+        return self.settings.model_name
 
     def unload(self) -> bool:
         with self._state_lock:
@@ -587,6 +605,9 @@ class WhisperCppEngine:
     def reported_device(self) -> str:
         return self.device
 
+    def reported_model(self) -> str:
+        return self.settings.model_name
+
     def unload(self) -> bool:
         with self._state_lock:
             if self.process is None or self.process.poll() is not None:
@@ -664,8 +685,80 @@ class WhisperCppEngine:
             self._end_use()
 
 
+class OpenAIEngine:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.device = "openai-api"
+
+    def load(self) -> None:
+        if not self.settings.token:
+            raise RuntimeError("PTT_TOKEN is missing in .env")
+        if not self.settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is missing in the environment or .env")
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    def is_loaded(self) -> bool:
+        return True
+
+    def reported_device(self) -> str:
+        return self.device
+
+    def reported_model(self) -> str:
+        return self.settings.openai_model
+
+    def unload(self) -> bool:
+        return False
+
+    def maybe_unload_idle(self) -> bool:
+        return False
+
+    def shutdown(self) -> None:
+        return None
+
+    def transcribe(self, audio_path: Path, language: str | None) -> dict[str, object]:
+        self.load()
+
+        data = {"model": self.settings.openai_model}
+        if language:
+            data["language"] = language
+
+        started_at = time.perf_counter()
+        try:
+            with audio_path.open("rb") as audio_file:
+                response = httpx.post(
+                    f"{self.settings.openai_base_url}/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {self.settings.openai_api_key}"},
+                    data=data,
+                    files={"file": (audio_path.name, audio_file, "audio/wav")},
+                    timeout=self.settings.openai_timeout_ms / 1000,
+                )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text.strip()[:500]
+            raise RuntimeError(
+                f"OpenAI transcription failed ({exc.response.status_code}): {detail}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"OpenAI transcription request failed: {exc}") from exc
+
+        payload = response.json()
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+
+        return {
+            "text": clean_text(str(payload.get("text", ""))),
+            "language": language or "",
+            "duration_ms": duration_ms,
+            "device": self.device,
+            "model": self.reported_model(),
+        }
+
+
 class IdleUnloadMonitor:
-    def __init__(self, engine: FasterWhisperEngine | WhisperCppEngine, interval_seconds: int) -> None:
+    def __init__(
+        self,
+        engine: FasterWhisperEngine | WhisperCppEngine | OpenAIEngine,
+        interval_seconds: int,
+    ) -> None:
         self.engine = engine
         self.interval_seconds = max(1, interval_seconds)
         self._stop_event = threading.Event()
@@ -689,12 +782,20 @@ class IdleUnloadMonitor:
 
 SETTINGS = Settings.from_env()
 configure_logging(SETTINGS.log_level)
-ENGINE = WhisperCppEngine(SETTINGS) if SETTINGS.backend == "whispercpp" else FasterWhisperEngine(SETTINGS)
+
+if SETTINGS.backend == "whispercpp":
+    ENGINE = WhisperCppEngine(SETTINGS)
+elif SETTINGS.backend == "openai":
+    ENGINE = OpenAIEngine(SETTINGS)
+else:
+    ENGINE = FasterWhisperEngine(SETTINGS)
+
 IDLE_MONITOR = IdleUnloadMonitor(ENGINE, SETTINGS.idle_check_seconds)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
     IDLE_MONITOR.start()
     if SETTINGS.preload_on_start:
         ENGINE.load()
@@ -725,7 +826,7 @@ async def healthz() -> dict[str, object]:
         "backend": SETTINGS.backend,
         "device": ENGINE.reported_device(),
         "loaded": ENGINE.is_loaded(),
-        "model": SETTINGS.model_name,
+        "model": ENGINE.reported_model(),
         "preload_on_start": SETTINGS.preload_on_start,
         "idle_unload_seconds": SETTINGS.idle_unload_seconds,
         "host_accessible_url": f"http://{SETTINGS.host_accessible_ip}:{SETTINGS.port}",
@@ -764,7 +865,7 @@ async def transcribe(
                 "language": selected_language or "",
                 "duration_ms": int((time.perf_counter() - started_at) * 1000),
                 "device": ENGINE.reported_device(),
-                "model": SETTINGS.model_name,
+                "model": ENGINE.reported_model(),
             }
         try:
             return ENGINE.transcribe(temp_path, selected_language)

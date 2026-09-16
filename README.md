@@ -6,15 +6,13 @@ Lokaler HTTP-Dienst fuer Push-to-Talk-Diktat von einer Ubuntu-VM auf den Windows
 
 - Oeffentlicher Endpoint: `POST /transcribe`
 - Security: `X-PTT-Token`
-- Default-Modell: `small`
-- Aktives Backend auf diesem Host: `whisper.cpp` mit `Vulkan`
-- Aktives Device auf diesem Host: `AMD Radeon RX 7900 XTX`
+- Aktives Backend auf diesem Host: `openai` (OpenAI Audio Transcriptions API)
+- Default-Modell: `gpt-4o-transcribe`
 - Externe Service-URL fuer die VM: `http://192.168.56.1:8765/transcribe`
 - Startverhalten: HTTP-Dienst beim Login, Modell per Lazy-Load beim ersten Request
-- Idle-Unload: nach `900` Sekunden ohne Request
-- Anti-Halluzinationen: Silero-VAD, deaktivierter Text-Context (`-mc 0`), `--suppress-nst`, strengerer No-Speech-Threshold und vorgelagerte WAV-Silence-Gate
+- Anti-Halluzinationen fuer den OpenAI-Pfad: vorgelagerte WAV-Silence-Gate; die lokalen VAD-/No-Context-Optionen gelten nur fuer `whispercpp`
 
-Der bisherige `faster-whisper`-Pfad bleibt als CPU-/CUDA-Fallback im Python-Service erhalten. Aktiv ist im Moment aber `ASR_BACKEND=whispercpp`.
+Der API-Key wird aus der Windows-Benutzerumgebung (`OPENAI_API_KEY`) gelesen, optional zusaetzlich aus `.env`. Der Download des OpenAI-Modells entfaellt, daher kein GPU-Build und keine lokalen Modelle noetig. Die lokalen Backends `whispercpp` (Vulkan) und `faster-whisper` (CPU/CUDA) bleiben als Fallback im Python-Service erhalten.
 
 ## Schnellstart
 
@@ -65,9 +63,15 @@ Windows-Test:
 
 ## Konfiguration
 
-Wichtige Werte in `.env`:
+Wichtige Werte in `.env` (OpenAI-Backend):
 
-- `ASR_BACKEND=whispercpp`
+- `ASR_BACKEND=openai`
+- `OPENAI_MODEL=gpt-4o-transcribe`
+- `OPENAI_TIMEOUT_MS=120000`
+- `OPENAI_BASE_URL=https://api.openai.com/v1`
+
+Nur fuer den lokalen `whispercpp`-Fallback:
+
 - `WHISPER_MODEL=small`
 - `WHISPERCPP_BINARY_PATH=whisper.cpp/build-vulkan-vs2022/bin/Release/whisper-server.exe`
 - `WHISPERCPP_MODEL_PATH=whisper.cpp/models/ggml-small.bin`
