@@ -50,7 +50,7 @@ Ubuntu-VM:
 
 ```bash
 curl -s -X POST http://192.168.56.1:8765/transcribe \
-  -H "X-PTT-Token: 9368cbde5e5e493485b6b991e8ddb51e" \
+  -H "X-PTT-Token: $PTT_TOKEN" \
   -F "audio=@recording.wav" \
   -F "language=de"
 ```
