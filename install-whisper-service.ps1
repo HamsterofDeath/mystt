@@ -1,4 +1,5 @@
 param(
+    [string]$PythonExe = "",
     [switch]$SkipFirewallRule,
     [switch]$PreloadMedium
 )
@@ -24,9 +25,26 @@ function Get-DotEnvValue {
     return $match.Matches[0].Groups[1].Value.Trim()
 }
 
+function Resolve-PythonExe {
+    param([string]$Explicit)
+    if ($Explicit) { return $Explicit }
+    $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyLauncher) {
+        try {
+            $resolved = (& py -3 -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1)
+            if ($resolved -and (Test-Path $resolved.Trim())) { return $resolved.Trim() }
+        } catch { }
+    }
+    foreach ($candidate in @("python", "python3")) {
+        $command = Get-Command $candidate -ErrorAction SilentlyContinue
+        if ($command) { return $command.Source }
+    }
+    return ""
+}
+
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $EnvPath = Join-Path $ProjectRoot ".env"
-$PythonExe = "C:\Users\dhaup\AppData\Local\Programs\Python\Python313\python.exe"
+$PythonExe = Resolve-PythonExe -Explicit $PythonExe
 $VenvPath = Join-Path $ProjectRoot ".venv"
 $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
 $Port = Get-DotEnvValue -Path $EnvPath -Name "SERVICE_PORT" -Default "8765"
@@ -45,12 +63,17 @@ if (-not (Test-Path $VenvPython)) {
 & $VenvPython -m pip install -r (Join-Path $ProjectRoot "requirements.txt")
 
 if ($Backend -eq "faster-whisper") {
-    & $VenvPython -c "import service; service.preload_from_env()"
-
-    if ($PreloadMedium) {
-        $env:WHISPER_MODEL = "medium"
+    Push-Location $ProjectRoot
+    try {
         & $VenvPython -c "import service; service.preload_from_env()"
-        Remove-Item Env:WHISPER_MODEL
+
+        if ($PreloadMedium) {
+            $env:WHISPER_MODEL = "medium"
+            & $VenvPython -c "import service; service.preload_from_env()"
+            Remove-Item Env:WHISPER_MODEL
+        }
+    } finally {
+        Pop-Location
     }
 } else {
     Write-Host "Skipping faster-whisper preload because ASR_BACKEND=$Backend"
